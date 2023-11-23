@@ -81,6 +81,7 @@ static int dev_open(struct sr_dev_inst *sdi)
 	int ret;
 
 	devc = sdi->priv;
+	devc->ftdic = ftdi_new();
 
 	ret = ftdi_set_interface(devc->ftdic, devc->dev_iface);
 	if (ret < 0) {
@@ -89,15 +90,14 @@ static int dev_open(struct sr_dev_inst *sdi)
 		return SR_ERR;
 	}
 
-	ret = ftdi_usb_open_desc(devc->ftdic, devc->dev_vid, devc->dev_pid,
-				 NULL, NULL);
+	ret = ftdi_usb_open_string(devc->ftdic, sdi->connection_id);
 	if (ret < 0) {
-		sr_err("Failed to open device (%d): %s", ret,
-		       ftdi_get_error_string(devc->ftdic));
+		sr_err("Failed to open device %s: %d %s", sdi->connection_id,
+		       ret, ftdi_get_error_string(devc->ftdic));
 		return SR_ERR;
 	}
 
-	if ((ret = ftdi_usb_purge_buffers(devc->ftdic)) < 0) {
+	if ((ret = ftdi_tcioflush(devc->ftdic)) < 0) {
 		sr_err("Failed to purge FTDI RX/TX buffers (%d): %s.",
 		       ret, ftdi_get_error_string(devc->ftdic));
 		goto err_dev_open_close_ftdic;
@@ -131,6 +131,8 @@ static int dev_open(struct sr_dev_inst *sdi)
 		goto err_dev_open_close_ftdic;
 	}
 
+	devc->data_buf = g_malloc0(DATA_BUF_SIZE * openlb_unitsize(devc));
+
 	return SR_OK;
 
 err_dev_open_close_ftdic:
@@ -148,99 +150,97 @@ static int dev_close(struct sr_dev_inst *sdi)
 	return openlb_close(devc);
 }
 
-static GSList *scan(struct sr_dev_driver *di, GSList *options)
+static int scan_dev(struct ftdi_context *ftdi, GSList **devs,
+		    struct libusb_device *dev, struct olb_targets_s *target)
 {
-	struct sr_dev_inst *sdi;
+	struct libusb_device_descriptor usb_desc;
 	struct dev_context *devc;
-	struct olb_targets_s *target;
-	int ret;
-	int max_channels;
+	struct sr_dev_inst *sdi;
 	unsigned int i;
 
-	(void)options;
+	(void)ftdi;
+
+	libusb_get_device_descriptor(dev, &usb_desc);
+
+	/* we should already have the target identified, but just to be sure */
+	if (target->vid != usb_desc.idVendor ||
+	    target->pid != usb_desc.idProduct) {
+		return -1;
+	}
 
 	devc = g_malloc0(sizeof(struct dev_context));
 
 	devc->data_buf      = NULL;
-	devc->data_pos      = 0;
-	devc->num_samples   = 0;
 	devc->sample_rate   = SR_MHZ(100);
 	devc->num_channels  = 32;
-	devc->cfg_test_mode = 0;
+	devc->dev_vid   = target->vid;
+	devc->dev_pid   = target->pid;
+	devc->dev_iface = target->iface;
 
-	if (!(devc->ftdic = ftdi_new())) {
+	sdi = g_malloc0(sizeof(struct sr_dev_inst));
+	sdi->status = SR_ST_INACTIVE;
+	sdi->vendor = g_strdup("OpenLogicBit");
+	sdi->priv = devc;
+	sdi->connection_id = g_strdup_printf("d:%u/%u",
+		libusb_get_bus_number(dev), libusb_get_device_address(dev));
+
+	/* todo: query from device */
+	devc->num_channels = target->num_channels;
+	for (i = 0; i < devc->num_channels; i++)
+		sr_channel_new(sdi, i, SR_CHANNEL_LOGIC, TRUE, channel_names[i]);
+
+	*devs = g_slist_append(*devs, sdi);
+
+	return 0;
+}
+
+static int scan_ftdi_list(struct ftdi_context *ftdi, GSList **devs,
+			  struct ftdi_device_list *ftdi_list,
+			  struct olb_targets_s *target)
+{
+	struct ftdi_device_list *ftdi_dev;
+
+	for (ftdi_dev = ftdi_list; ftdi_dev; ftdi_dev = ftdi_dev->next) {
+		scan_dev(ftdi, devs, ftdi_dev->dev, target);
+	}
+
+	return 0;
+}
+
+static GSList *scan(struct sr_dev_driver *di, GSList *options)
+{
+	struct ftdi_context *ftdi;
+	GSList *devs = NULL;
+	unsigned int i;
+	int ret;
+
+	(void)options;
+
+	ftdi = ftdi_new();
+	if (!ftdi) {
 		sr_err("Failed to initialize libftdi.");
 		return NULL;
 	}
 
-	target = NULL;
 	for (i = 0; i < ARRAY_SIZE(target_list); i++) {
-		target = &target_list[i];
+		struct ftdi_device_list *ftdi_list;
+		struct olb_targets_s *target = &target_list[i];
 
-		/* Try and open device by vid/pid */
-		ret = ftdi_usb_open_desc(devc->ftdic, target->vid, target->pid, NULL, NULL);
-
-		/* All fine - we found a candidate */
-		if (ret == 0) {
-			sr_info("Found a candidate device for open-logic-bit (vid=%04x, pid=%04x)", 
-					 target->vid, target->pid);
-			ftdi_usb_close(devc->ftdic);
-			break;
-		}
-
-		/* Not found, try next candidate */
-		target = NULL;
-	}
-
-	/* Found a candidate device */
-	if (target != NULL) {
-		devc->dev_vid   = target->vid;
-		devc->dev_pid   = target->pid;
-		devc->dev_iface = target->iface;
-
-		ret = ftdi_usb_open_desc(devc->ftdic, devc->dev_vid, devc->dev_pid, NULL, NULL);
+		ret = ftdi_usb_find_all(ftdi, &ftdi_list,
+					target->vid, target->pid);
 		if (ret < 0) {
-			/* Log errors, except for -3 ("device not found"). */
-			if (ret != -3)
-				sr_err("Failed to open device (%d): %s", ret,
-				       ftdi_get_error_string(devc->ftdic));
-			goto err_free_ftdic;
+			sr_err("Failed to find FTDI devices.");
+			continue;
+		} else if  (ret > 0) {
+			scan_ftdi_list(ftdi, &devs, ftdi_list, target);
 		}
 
-		sdi = g_malloc0(sizeof(struct sr_dev_inst));
-		sdi->status = SR_ST_INACTIVE;
-		sdi->vendor = g_strdup("OpenLogicBit");
-		sdi->model  = NULL;
-		sdi->priv   = devc;
-
-		ftdi_usb_close(devc->ftdic);
-
-		/* Try and query number of channels supported on the device
-		   unless explicit number of channels listed */
-		max_channels = target->num_channels;
-		if (max_channels == -1 && dev_open(sdi) == SR_OK) {
-			max_channels = openlb_read_max_channels(sdi);
-			if (max_channels < 0)
-				sr_err("Failed to read number of supported device channels.");
-			dev_close(sdi);
-		}
-
-		devc->num_channels = (uint32_t)max_channels;
-		for (i = 0; i < devc->num_channels; i++)
-			sr_channel_new(sdi, i, SR_CHANNEL_LOGIC, TRUE, channel_names[i]);
-
-		/* Now that we know the number of channels, allocate memory for
-		   the incoming data. */
-		devc->data_buf = g_malloc0(DATA_BUF_SIZE *
-					   openlb_unitsize(devc));
-		return std_scan_complete(di, g_slist_append(NULL, sdi));
+		ftdi_list_free(&ftdi_list);
 	}
 
-err_free_ftdic:
-	ftdi_free(devc->ftdic);
-	g_free(devc);
+	ftdi_free(ftdi);
 
-	return NULL;
+	return std_scan_complete(di, devs);
 }
 
 static int config_get(uint32_t key, GVariant **data,
